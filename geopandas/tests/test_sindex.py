@@ -1,4 +1,7 @@
+import gc
+import pickle
 import re
+import weakref
 from math import sqrt
 
 import numpy as np
@@ -162,19 +165,10 @@ class TestFrameSindex:
     def test_rebuild_on_multiple_col_selection(self):
         """Selecting a subset of columns preserves the index."""
         original_index = self.df.sindex
-        # Selecting a subset of columns preserves the index for pandas < 2.0
-        # with pandas 2.0, the column is now copied, losing the index. But
-        # with pandas >= 3.0 and Copy-on-Write this is preserved again
         subset1 = self.df[["geom", "A"]]
-        if not compat.PANDAS_GE_30:
-            assert subset1.sindex is not original_index
-        else:
-            assert subset1.sindex is original_index
+        assert subset1.sindex._tree is original_index._tree
         subset2 = self.df[["A", "geom"]]
-        if not compat.PANDAS_GE_30:
-            assert subset2.sindex is not original_index
-        else:
-            assert subset2.sindex is original_index
+        assert subset2.sindex._tree is original_index._tree
 
     def test_rebuild_on_update_inplace(self):
         gdf = self.df.copy()
@@ -988,3 +982,146 @@ class TestShapelyInterface:
 
         res = world.sindex.query(capitals.geometry, predicate)
         assert res.shape == expected_shape
+
+
+@pytest.mark.parametrize("indexer", [slice(None), slice(0, 1), slice(None, None, -1)])
+@pytest.mark.parametrize("mutate_view", [False, True])
+def test_array_view_invalidates_spatial_indexes(indexer, mutate_view):
+    array = geopandas.array.from_shapely([Point(0, 0), Point(10, 10)])
+    view = array[indexer]
+    array.sindex
+    view.sindex
+    changed = view if mutate_view else array
+    changed[0] = Point(20, 20)
+    assert not array.has_sindex
+    assert not view.has_sindex
+    for data in (array, view):
+        expected = np.flatnonzero(shapely.intersects(data, Point(20, 20)))
+        assert_array_equal(data.sindex.query(Point(20, 20)), expected)
+
+
+def test_array_constructor_shares_index_generation():
+    array = geopandas.array.from_shapely([Point(0, 0)])
+    tree = array.sindex
+    alias = geopandas.array.GeometryArray(array)
+    assert alias.sindex is tree
+    alias[0] = Point(1, 1)
+    assert not array.has_sindex
+    assert_array_equal(array.sindex.query(Point(1, 1)), [0])
+
+
+def test_array_copy_preserves_index_independently():
+    array = geopandas.array.from_shapely([Point(0, 0), Point(10, 10)])
+    tree = array.sindex
+    copied = array.copy()
+    assert copied.sindex._tree is tree._tree
+    assert not np.shares_memory(copied._data, array._data)
+    assert not np.shares_memory(copied.sindex.geometries, tree.geometries)
+    copied.sindex.geometries[0] = Point(99, 99)
+    assert tree.geometries[0] == Point(0, 0)
+    array[0] = Point(20, 20)
+    assert copied.sindex._tree is tree._tree
+    assert_array_equal(copied.sindex.query(Point(0, 0)), [0])
+    copied[1] = Point(30, 30)
+    assert_array_equal(array.sindex.query(Point(10, 10)), [1])
+    assert_array_equal(copied.sindex.query(Point(30, 30)), [1])
+
+
+@pytest.mark.parametrize("allow_fill", [False, True])
+def test_array_identity_take_preserves_index_independently(allow_fill):
+    array = geopandas.array.from_shapely([Point(0, 0), None, Point(10, 10)])
+    tree = array.sindex
+    copied = array.take(range(len(array)), allow_fill=allow_fill)
+    assert copied.has_sindex
+    assert copied.sindex._tree is tree._tree
+    assert not np.shares_memory(copied._data, array._data)
+    assert not np.shares_memory(copied.sindex.geometries, tree.geometries)
+    copied[0] = Point(20, 20)
+    assert array.sindex is tree
+    assert_array_equal(array.sindex.query(Point(0, 0)), [0])
+    assert_array_equal(copied.sindex.query(Point(20, 20)), [0])
+
+
+@pytest.mark.parametrize("indices", [[2, 1, 0], [0, 0, 2], [2, 0]])
+def test_array_nonidentity_take_rebuilds_index(indices):
+    array = geopandas.array.from_shapely([Point(0, 0), None, Point(10, 10)])
+    array.sindex
+    taken = array.take(indices)
+    assert not taken.has_sindex
+    expected = np.flatnonzero(shapely.intersects(taken, Point(10, 10)))
+    assert_array_equal(taken.sindex.query(Point(10, 10)), expected)
+
+
+@pytest.mark.parametrize("copy", [False, True])
+def test_array_fillna_invalidates_index(copy):
+    array = geopandas.array.from_shapely([None, Point(10, 10)])
+    view = array[:]
+    tree = array.sindex
+    view.sindex
+    filled = view.fillna(Point(20, 20), copy=copy)
+    assert not filled.has_sindex
+    assert_array_equal(filled.sindex.query(Point(20, 20)), [0])
+    if copy:
+        assert array.sindex is tree
+        assert_array_equal(array.sindex.query(Point(20, 20)), [])
+    else:
+        assert not array.has_sindex
+        assert_array_equal(array.sindex.query(Point(20, 20)), [0])
+
+
+def test_array_pickle_resets_index_generation():
+    array = geopandas.array.from_shapely([Point(0, 0)])
+    array[0] = Point(1, 1)
+    array.sindex
+    restored = pickle.loads(pickle.dumps(array))
+    assert not restored.has_sindex
+    assert_array_equal(restored.sindex.query(Point(1, 1)), [0])
+    array[0] = Point(2, 2)
+    assert restored.has_sindex
+    assert_array_equal(restored.sindex.query(Point(1, 1)), [0])
+
+
+@pytest.mark.parametrize("slice_", [slice(None), slice(None, None, -1)])
+def test_array_public_numpy_roundtrip_invalidates_index(slice_):
+    array = geopandas.array.from_shapely([Point(0, 0), Point(10, 10)])
+    alias = geopandas.array.from_shapely(geopandas.array.to_shapely(array)[slice_])
+    assert np.shares_memory(array._data, alias._data)
+    array.sindex
+    alias.sindex
+    alias[0] = Point(20, 20)
+    assert not array.has_sindex
+    assert not alias.has_sindex
+    expected = np.flatnonzero(shapely.intersects(array, Point(20, 20)))
+    assert_array_equal(array.sindex.query(Point(20, 20)), expected)
+
+
+@pytest.mark.parametrize("adapter", ["memoryview", "strided"])
+def test_array_numpy_buffer_adapter_invalidates_index(adapter):
+    array = geopandas.array.from_shapely([Point(0, 0), Point(10, 10)])
+    values = geopandas.array.to_shapely(array)
+    if adapter == "memoryview":
+        values = np.asarray(memoryview(values))
+    else:
+        values = np.lib.stride_tricks.as_strided(values)
+    alias = geopandas.array.from_shapely(values)
+    assert np.shares_memory(array._data, alias._data)
+    array.sindex
+    alias.sindex
+    alias[0] = Point(20, 20)
+    assert not array.has_sindex
+    assert_array_equal(array.sindex.query(Point(0, 0)), [])
+    assert_array_equal(array.sindex.query(Point(20, 20)), [0])
+
+
+def test_array_spatial_index_state_released():
+    array = geopandas.array.from_shapely([Point(0, 0)])
+    key = id(array._sindex_state.owner)
+    state_ref = weakref.ref(array._sindex_state)
+    view = array[:]
+    del array
+    gc.collect()
+    assert state_ref() is not None
+    del view
+    gc.collect()
+    assert state_ref() is None
+    assert key not in geopandas.array._sindex_states

@@ -1,5 +1,12 @@
 # Changelog
 
+## Version 1.3.0 (unreleased)
+
+New features and improvements:
+
+- `sjoin_nearest` now supports `on_attribute` to search for the nearest geometry
+  among rows with matching attribute values (#3327).
+
 ## Version 1.2.0 (September 28, 2026)
 
 New features and improvements:

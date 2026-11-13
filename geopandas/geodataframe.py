@@ -2696,6 +2696,7 @@ default 'snappy'
         rsuffix: str = "right",
         distance_col: str | None = None,
         exclusive: bool = False,
+        on_attribute: str | list | tuple | None = None,
     ) -> GeoDataFrame:
         """
         Spatial join of two GeoDataFrames based on the distance between their
@@ -2736,6 +2737,13 @@ default 'snappy'
         exclusive : bool, optional, default False
             If True, the nearest geometries that are equal to the input geometry
             will not be returned, default False.
+
+        on_attribute : string, list or tuple, optional
+            Column name(s) present in both frames that must match. The nearest
+            geometry is selected among rows with matching attribute values,
+            which can differ from the nearest geometry overall. Rows with
+            missing values in any of these columns do not match. Attribute
+            values must be hashable.
 
         Examples
         --------
@@ -2819,6 +2827,7 @@ chicago_w_groceries[chicago_w_groceries["community"] == "UPTOWN"]
             rsuffix=rsuffix,
             distance_col=distance_col,
             exclusive=exclusive,
+            on_attribute=on_attribute,
         )
 
     def clip(

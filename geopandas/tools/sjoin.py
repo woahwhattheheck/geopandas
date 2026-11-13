@@ -524,6 +524,17 @@ def _nearest_query(
     exclusive: bool,
     on_attribute: list | None = None,
 ):
+    if on_attribute:
+        return _attribute_nearest_query(
+            left_df,
+            right_df,
+            max_distance,
+            how,
+            return_distance,
+            exclusive,
+            on_attribute,
+        )
+
     # use the opposite of the join direction for the index
     use_left_as_sindex = how == "right"
     if use_left_as_sindex:
@@ -561,14 +572,68 @@ def _nearest_query(
         else:
             distances = None
 
-    if on_attribute:
-        for attr in on_attribute:
-            (l_idx, r_idx), shared_attribute_rows = _filter_shared_attribute(
-                left_df, right_df, l_idx, r_idx, attr
-            )
-            distances = distances[shared_attribute_rows]
-
     return (l_idx, r_idx), distances
+
+
+def _attribute_nearest_query(
+    left_df, right_df, max_distance, how, return_distance, exclusive, on_attribute
+):
+    """Find nearest geometries within each shared attribute group."""
+    # Validate even when there are no shared groups and no query is executed.
+    if max_distance is not None:
+        if not np.isscalar(max_distance):
+            raise ValueError("max_distance parameter only accepts scalar values")
+        if max_distance <= 0:
+            raise ValueError("max_distance must be greater than 0")
+    if not np.isscalar(exclusive):
+        raise ValueError("exclusive parameter only accepts scalar values")
+    if exclusive not in {True, False}:
+        raise ValueError("exclusive parameter must be boolean")
+
+    # Use positional groups: frame indexes can be nonunique or have the same
+    # names as the attributes. Missing attributes do not match.
+    def groups(frame):
+        return frame.groupby(
+            [frame[attr] for attr in on_attribute],
+            sort=False,
+            observed=True,
+            dropna=True,
+        ).indices
+
+    left_groups, right_groups = groups(left_df), groups(right_df)
+    left_geometry, right_geometry = left_df.geometry, right_df.geometry
+    left_matches, right_matches, matched_distances = [], [], []
+    for key, left_positions in left_groups.items():
+        right_positions = right_groups.get(key)
+        if right_positions is None:
+            continue
+        # Only geometry is needed for the spatial query. Do not copy unrelated
+        # columns for every group or build an unrestricted spatial index.
+        left = left_geometry.iloc[left_positions].to_frame()
+        right = right_geometry.iloc[right_positions].to_frame()
+        (l_idx, r_idx), distances = _nearest_query(
+            left,
+            right,
+            max_distance,
+            how,
+            return_distance,
+            exclusive,
+        )
+        left_matches.append(left_positions[l_idx])
+        right_matches.append(right_positions[r_idx])
+        if return_distance:
+            matched_distances.append(distances)
+
+    if not left_matches:
+        empty = np.array([], dtype=np.intp)
+        distances = np.array([], dtype=np.float64) if return_distance else None
+        return (empty, empty.copy()), distances
+
+    l_idx, r_idx = np.concatenate(left_matches), np.concatenate(right_matches)
+    # _frame_join expects left-sorted positions when inserting unmatched rows.
+    order = np.argsort(l_idx, kind="stable")
+    distances = np.concatenate(matched_distances)[order] if return_distance else None
+    return (l_idx[order], r_idx[order]), distances
 
 
 def _filter_shared_attribute(left_df, right_df, l_idx, r_idx, attribute):
@@ -595,6 +660,7 @@ def sjoin_nearest(
     rsuffix: str = "right",
     distance_col: str | None = None,
     exclusive: bool = False,
+    on_attribute: str | list | tuple | None = None,
 ) -> GeoDataFrame:
     """Spatial join of two GeoDataFrames based on the distance between their geometries.
 
@@ -635,6 +701,12 @@ def sjoin_nearest(
     exclusive : bool, default False
         If True, the nearest geometries that are equal to the input geometry
         will not be returned, default False.
+
+    on_attribute : string, list or tuple, optional
+        Column name(s) present in both frames that must match. The nearest
+        geometry is selected among rows with matching attribute values, which
+        can differ from the nearest geometry overall. Rows with missing values
+        in any of these columns do not match. Attribute values must be hashable.
 
     Examples
     --------
@@ -709,7 +781,8 @@ chicago_w_groceries[chicago_w_groceries["community"] == "UPTOWN"]
     Every operation in GeoPandas is planar, i.e. the potential third
     dimension is not taken into account.
     """
-    _basic_checks(left_df, right_df, how, lsuffix, rsuffix)
+    on_attribute = _maybe_make_list(on_attribute)
+    _basic_checks(left_df, right_df, how, lsuffix, rsuffix, on_attribute=on_attribute)
 
     left_df.geometry.values.check_geographic_crs(stacklevel=1)
     right_df.geometry.values.check_geographic_crs(stacklevel=1)
@@ -723,7 +796,13 @@ chicago_w_groceries[chicago_w_groceries["community"] == "UPTOWN"]
         how,
         return_distance,
         exclusive,
+        on_attribute=on_attribute,
     )
+    if how == "right" and on_attribute:
+        # Keep the right-side attributes, including values in unmatched rows.
+        left_df = left_df.drop(on_attribute, axis=1)
+        on_attribute = None
+
     joined, distances = _frame_join(
         left_df,
         right_df,
@@ -733,6 +812,7 @@ chicago_w_groceries[chicago_w_groceries["community"] == "UPTOWN"]
         lsuffix,
         rsuffix,
         None,
+        on_attribute=on_attribute,
     )
 
     if return_distance:

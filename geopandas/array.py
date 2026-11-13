@@ -5,7 +5,9 @@ import numbers
 import operator
 import typing
 import warnings
+import weakref
 from functools import lru_cache
+from threading import Lock
 from typing import Any, ClassVar, Literal
 
 import numpy as np
@@ -343,6 +345,40 @@ def points_from_xy(
     return GeometryArray(shapely.points(x, y, z), crs=crs)
 
 
+class _SpatialIndexState:
+    __slots__ = ("__weakref__", "owner", "version")
+
+    def __init__(self, owner):
+        self.owner = owner
+        self.version = 0
+
+
+# Weak values keep this registry bounded by live GeometryArrays. The state owns
+# the buffer owner so its identity cannot be reused while a wrapper references it.
+_sindex_states = weakref.WeakValueDictionary()
+_sindex_state_lock = Lock()
+
+
+def _get_sindex_state(data):
+    owner = data
+    # NumPy views may expose a memoryview or a stride-trick adapter as their
+    # base. Follow these ownership links as well as direct ndarray bases.
+    while True:
+        base = (
+            owner.obj if isinstance(owner, memoryview) else getattr(owner, "base", None)
+        )
+        if base is None:
+            break
+        owner = base
+    key = id(owner)
+    with _sindex_state_lock:
+        state = _sindex_states.get(key)
+        if state is None:
+            state = _SpatialIndexState(owner)
+            _sindex_states[key] = state
+        return state
+
+
 class GeometryArray(ExtensionArray):
     """Class wrapping a numpy array of Shapely objects.
 
@@ -352,7 +388,9 @@ class GeometryArray(ExtensionArray):
     _dtype = GeometryDtype()
 
     def __init__(self, data, crs: Any | None = None):
+        sindex = None
         if isinstance(data, self.__class__):
+            sindex = data._sindex if data.has_sindex else None
             if not crs:
                 crs = data.crs
             data = data._data
@@ -369,13 +407,18 @@ class GeometryArray(ExtensionArray):
 
         self._crs = None
         self.crs = crs
-        self._sindex = None
+        # True buffer views share this mutation counter, but each view has its
+        # own index because its positions may differ from the parent array.
+        self._sindex_state = _get_sindex_state(data)
+        self._sindex_version = self._sindex_state.version
+        self._sindex = sindex
 
     @property
     def sindex(self) -> SpatialIndex:
         """Spatial index for the geometries in this array."""
-        if self._sindex is None:
+        if not self.has_sindex:
             self._sindex = SpatialIndex(self._data)
+            self._sindex_version = self._sindex_state.version
         return self._sindex
 
     @property
@@ -400,7 +443,14 @@ class GeometryArray(ExtensionArray):
             `True` if the spatial index has been generated or
             `False` if not.
         """
-        return self._sindex is not None
+        return (
+            self._sindex is not None
+            and self._sindex_version == self._sindex_state.version
+        )
+
+    def _invalidate_sindex(self):
+        self._sindex_state.version += 1
+        self._sindex = None
 
     @property
     def crs(self) -> CRS:
@@ -454,23 +504,23 @@ class GeometryArray(ExtensionArray):
     def __getitem__(self, idx) -> GeometryArray:
         if isinstance(idx, numbers.Integral):
             return self._data[idx]
-        elif (
-            isinstance(idx, slice)
-            and idx.start is None
-            and idx.stop is None
-            and idx.step is None
-        ):
-            # special case of a full slice -> preserve the sindex
-            # (to ensure view() preserves it as well)
-            result = GeometryArray(self._data[idx], crs=self.crs)
-            result._sindex = self._sindex
-            return result
 
         # array-like, slice
         # validate and convert IntegerArray/BooleanArray
         # to numpy array, pass-through non-array-like indexers
         idx = pd.api.indexers.check_array_indexer(self, idx)
-        return GeometryArray(self._data[idx], crs=self.crs)
+        values = self._data[idx]
+        result = GeometryArray(values, crs=self.crs)
+        if (
+            isinstance(idx, slice)
+            and idx.start is None
+            and idx.stop is None
+            and idx.step is None
+            and self.has_sindex
+        ):
+            result._sindex = self._sindex
+            result._sindex_version = self._sindex_state.version
+        return result
 
     def __setitem__(self, key, value):
         # validate and convert IntegerArray/BooleanArray
@@ -507,7 +557,7 @@ class GeometryArray(ExtensionArray):
             )
 
         # invalidate spatial index
-        self._sindex = None
+        self._invalidate_sindex()
 
         # TODO: use this once pandas-dev/pandas#33457 is fixed
         # if hasattr(value, "crs"):
@@ -534,6 +584,9 @@ class GeometryArray(ExtensionArray):
             if "_crs" not in state:
                 state["_crs"] = None
             self.__dict__.update(state)
+        self._sindex_state = _get_sindex_state(self._data)
+        self._sindex_version = self._sindex_state.version
+        self._sindex = None
 
     # -------------------------------------------------------------------------
     # Geometry related methods
@@ -1380,7 +1433,10 @@ class GeometryArray(ExtensionArray):
 
     def copy(self, *args, **kwargs) -> GeometryArray:
         # still taking args/kwargs for compat with pandas 0.24
-        return GeometryArray(self._data.copy(), crs=self._crs)
+        result = GeometryArray(self._data.copy(), crs=self._crs)
+        if self.has_sindex:
+            result._sindex = self._sindex._copy()
+        return result
 
     def take(self, indices, allow_fill: bool = False, fill_value=None) -> GeometryArray:
         from pandas.api.extensions import take
@@ -1394,7 +1450,16 @@ class GeometryArray(ExtensionArray):
         result = take(self._data, indices, allow_fill=allow_fill, fill_value=fill_value)
         if allow_fill and fill_value is None:
             result[~shapely.is_valid_input(result)] = None
-        return GeometryArray(result, crs=self.crs)
+        result = GeometryArray(result, crs=self.crs)
+        if (
+            self.has_sindex
+            and len(result) == len(self)
+            and np.array_equal(indices, np.arange(len(self)))
+        ):
+            # The exact positional selection preserves both geometries and the
+            # positions returned by the tree, without comparing geometries.
+            result._sindex = self._sindex._copy()
+        return result
 
     # compat for pandas < 3.0
     def _pad_or_backfill(
@@ -1470,6 +1535,7 @@ class GeometryArray(ExtensionArray):
         value_arr = np.asarray(value, dtype=object)
 
         new_values._data[mask] = value_arr
+        new_values._invalidate_sindex()
         return new_values
 
     def astype(self, dtype, copy: bool = True) -> np.ndarray:

@@ -1350,3 +1350,127 @@ class TestNearest:
 
         if max_distance:
             assert result["dist"].max() <= max_distance
+
+
+@pytest.mark.parametrize("how", ["inner", "left", "right"])
+@pytest.mark.parametrize("distance_col", [None, "distance"])
+@pytest.mark.parametrize("on_attribute", ["kind", ["kind"], ("kind",)])
+def test_nearest_on_attribute(how, distance_col, on_attribute):
+    # The overall nearest feature has the wrong attribute; retain both ties
+    # among the eligible features, including nonunique row labels.
+    left = GeoDataFrame(
+        {"kind": ["a", "b", "missing"], "left_id": [0, 1, 2]},
+        geometry=[Point(0, 0), Point(10, 0), Point(20, 0)],
+        crs=3857,
+        index=[3, 3, 1],
+    )
+    right = GeoDataFrame(
+        {"kind": ["b", "a", "a", "right_only"], "right_id": [0, 1, 2, 3]},
+        geometry=[Point(0, 0), Point(-1, 0), Point(1, 0), Point(30, 0)],
+        crs=3857,
+        index=[4, 4, 2, 2],
+    )
+    result = left.sjoin_nearest(
+        right, how=how, on_attribute=on_attribute, distance_col=distance_col
+    )
+    pairs = result[["left_id", "right_id"]].dropna().astype(int)
+    assert set(map(tuple, pairs.to_numpy())) == {(0, 1), (0, 2), (1, 0)}
+    assert len(result) == (3 if how == "inner" else 4)
+    assert "kind_left" not in result and "kind_right" not in result
+    if how == "left":
+        assert result.iloc[-1]["kind"] == "missing"
+        assert result.index.tolist() == [3, 3, 3, 1]
+    elif how == "right":
+        assert result.iloc[-1]["kind"] == "right_only"
+        assert result.index.tolist() == [4, 4, 2, 2]
+    if distance_col:
+        actual = result.dropna(subset=["left_id", "right_id"])
+        assert dict(zip(map(tuple, pairs.to_numpy()), actual[distance_col])) == {
+            (0, 1): 1.0,
+            (0, 2): 1.0,
+            (1, 0): 10.0,
+        }
+
+
+@pytest.mark.parametrize("how", ["inner", "left", "right"])
+def test_nearest_on_attribute_missing_and_multiple(how):
+    left = GeoDataFrame(
+        {
+            "kind": pd.Categorical(["a", "a", None], categories=["a", "unused"]),
+            "year": pd.array([2020, 2021, 2020], dtype="Int64"),
+        },
+        geometry=[Point(0, 0)] * 3,
+        crs=3857,
+    )
+    right = GeoDataFrame(
+        {
+            "kind": pd.Categorical(["a", "a", None], categories=["other", "a"]),
+            "year": pd.array([2021, 2020, 2020], dtype="Int64"),
+        },
+        geometry=[Point(1, 0), Point(2, 0), Point(0, 0)],
+        crs=3857,
+    )
+    result = sjoin_nearest(
+        left, right, how=how, on_attribute=["kind", "year"], distance_col="distance"
+    )
+    assert result["distance"].dropna().tolist() == (
+        [1.0, 2.0] if how == "right" else [2.0, 1.0]
+    )
+    assert len(result) == (2 if how == "inner" else 3)
+    assert result["year"].dtype == left["year"].dtype
+
+
+@pytest.mark.parametrize("exclusive", [False, True])
+@pytest.mark.parametrize("max_distance", [None, 0.5, 2.0])
+def test_nearest_on_attribute_query_options(exclusive, max_distance):
+    left = GeoDataFrame({"kind": [1]}, geometry=[Point(0, 0)], crs=3857)
+    right = GeoDataFrame(
+        {"kind": [2, 1, 1]}, geometry=[Point(0, 0), Point(0, 0), Point(1, 0)], crs=3857
+    )
+    result = sjoin_nearest(
+        left,
+        right,
+        on_attribute="kind",
+        how="left",
+        exclusive=exclusive,
+        max_distance=max_distance,
+        distance_col="distance",
+    )
+    expected = np.nan if exclusive and max_distance == 0.5 else float(exclusive)
+    np.testing.assert_allclose(result["distance"], [expected], equal_nan=True)
+
+
+@pytest.mark.parametrize("empty", ["left", "right", "geometry", "attribute"])
+def test_nearest_on_attribute_empty(empty):
+    left = GeoDataFrame({"kind": [1]}, geometry=[Point(0, 0)], crs=3857)
+    right = left.copy()
+    if empty == "left":
+        left = left.iloc[:0]
+    elif empty == "right":
+        right = right.iloc[:0]
+    elif empty == "geometry":
+        right.geometry = [None]
+    else:
+        right["kind"] = [2]
+    result = sjoin_nearest(
+        left, right, on_attribute="kind", how="left", distance_col="distance"
+    )
+    assert len(result) == len(left)
+    assert result["distance"].isna().all()
+
+
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        ({"max_distance": 0}, "max_distance must be greater than 0"),
+        ({"max_distance": -1}, "max_distance must be greater than 0"),
+        ({"max_distance": [1]}, "max_distance parameter only accepts scalar values"),
+        ({"exclusive": [True]}, "exclusive parameter only accepts scalar values"),
+        ({"exclusive": "yes"}, "exclusive parameter must be boolean"),
+    ],
+)
+def test_nearest_on_attribute_invalid_options_without_matches(kwargs, match):
+    left = GeoDataFrame({"kind": [1]}, geometry=[Point(0, 0)], crs=3857)
+    right = GeoDataFrame({"kind": [2]}, geometry=[Point(0, 0)], crs=3857)
+    with pytest.raises(ValueError, match=match):
+        sjoin_nearest(left, right, on_attribute="kind", **kwargs)

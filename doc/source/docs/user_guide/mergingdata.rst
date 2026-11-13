@@ -153,7 +153,7 @@ Nearest joins
 Proximity-based joins can be done via :meth:`GeoDataFrame.sjoin_nearest`.
 
 :meth:`GeoDataFrame.sjoin_nearest` shares the ``how`` argument with :meth:`GeoDataFrame.sjoin`, and
-includes two additional arguments: ``max_distance`` and ``distance_col``.
+supports ``max_distance``, ``distance_col``, ``exclusive``, and ``on_attribute``.
 
 **max_distance**
 
@@ -163,3 +163,18 @@ If you can, it is highly recommended that you use this parameter.
 **distance_col**
 
 If set, the resultant GeoDataFrame will include a column with this name containing the computed distances between an input geometry and the nearest geometry.
+
+
+**on_attribute**
+
+Use ``on_attribute`` to require matching values in one or more columns before
+searching for the nearest geometry. For example,
+``observations.sjoin_nearest(stations, on_attribute="network")`` finds the nearest
+station in the observation's network, even if a station in another network is
+closer. A list of column names requires all of their values to match.
+
+This differs from filtering the results of an unrestricted nearest join: that
+could discard the nearest station without finding a more distant eligible one.
+Attribute values must be hashable, as for a pandas groupby. Rows with a missing
+value in any join attribute do not match. A left or right
+join still retains unmatched rows from the corresponding frame.

@@ -33,6 +33,13 @@ class SpatialIndex:
         # store geometries, including empty geometries for user access
         self.geometries = geometry.copy()
 
+    def _copy(self):
+        """Share the immutable tree while isolating mutable wrapper metadata."""
+        result = type(self).__new__(type(self))
+        result._tree = self._tree
+        result.geometries = self.geometries.copy()
+        return result
+
     @property
     def valid_query_predicates(self):
         """Returns valid predicates for the spatial index.
